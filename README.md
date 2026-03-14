@@ -66,3 +66,23 @@ The compiler reports errors for:
 ## Running the Compiler
 
 Build the project:
+cargo build
+
+
+Compile a Boa program:
+
+
+cargo run -- input.snek output.s
+
+
+Run tests:
+
+
+cargo test
+
+
+## Files
+
+- `src/main.rs` – parser and compiler implementation
+- `runtime/start.rs` – runtime entry point
+- `test/` – example Boa programs
