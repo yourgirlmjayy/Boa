@@ -1,68 +1,95 @@
-# Boa Compiler
+# Cobra Compiler
 
-This project implements a compiler for the Boa language in Rust.
+This project implements a compiler for the Cobra language, an extension of the Boa language. The compiler translates Cobra programs into x86-64 assembly.
 
-Boa extends the Adder language with:
-- variables (identifiers)
-- let expressions with multiple bindings
-- binary operations: +, -, *
+## Features Implemented
 
-The compiler reads a Boa program written as an S-expression and generates
-x86-64 assembly code.
+### Core Language
+- Integers (tagged representation)
+- Booleans (`true`, `false`)
+- Variables and `let` bindings
+- Arithmetic operations: `+`, `-`, `*`
+- Unary operations: `add1`, `sub1`, `negate`
 
-## Supported Expressions
+### Type Checking
+- Runtime type checks for arithmetic operations
+- Mixed-type operations (e.g. `(+ true 5)`) trigger errors
+- Equality checks enforce matching types
 
-The compiler supports the following syntax:
+### Control Flow
+- `if` expressions with proper branching
+- Nested `if` expressions supported
 
-<number>
-x
+### Comparison Operators
+- `<`, `>`, `<=`, `>=`
+- `=` (with type checking)
 
-(add1 e)
-(sub1 e)
+### Advanced Features
+- `block` expressions
+- `loop` with `break`
+- `set!` for variable mutation
+- `input` support
 
-(+ e1 e2)
-(- e1 e2)
-(* e1 e2)
+### Error Handling
+- Runtime error for invalid arguments
+- All type errors jump to a shared `error` label
+- Calls into `snek_error` in runtime
 
-(let ((x e1) (y e2) ...) body)
+---
 
-## Implementation
+## Tagged Representation
 
-The compiler works in two main stages.
+Values are represented as:
+- Numbers: `n << 1`
+- `true`: `3`
+- `false`: `1`
 
-### Parsing
+This allows efficient runtime type checking using the least significant bit.
 
-`parse_expr` converts the input S-expression into an Abstract Syntax Tree (AST).
-The AST types include:
+---
 
-- `Number`
-- `Id`
-- `UnOp`
-- `BinOp`
-- `Let`
+## Project Structure
 
-Bindings in let expressions are parsed using `parse_bind`.
 
-### Compilation
+cobra/
+├── src/
+│ └── main.rs # Compiler implementation
+├── runtime/
+│ └── start.rs # Runtime (entry point + error handling)
+├── Cargo.toml
+└── README.md
 
-`compile_to_instrs` converts the AST into x86-64 assembly instructions.
 
-Results of expressions are stored in the `rax` register.
-
-Variables are stored on the stack using offsets from `rsp`. The environment
-maps variable names to their stack locations.
-
-Binary operations use the stack to temporarily store the left operand while the
-right operand is evaluated.
-
-## Error Handling
-
-The compiler reports errors for:
-
-- invalid syntax
-- duplicate variable bindings in a `let`
-- use of unbound variables
+---
 
 ## Running the Compiler
 
-Build the project:
+Compile a `.snek` program:
+
+```bash
+cargo run input.snek output.s
+
+Then assemble and run:
+
+make output.run
+./output.run
+Running Tests
+
+Run all tests:
+
+cargo test
+
+Tests cover:
+
+Parsing correctness
+Control flow behavior
+Type errors
+Loops and break
+Comparisons
+Mutation (set!)
+Mixed-type operations
+Example Programs
+(+ 1 2)
+(if true 5 10)
+(loop (break 7))
+(let ((x 5)) (set! x 10))

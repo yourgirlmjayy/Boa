@@ -1,5 +1,5 @@
 // Assignment 2: Boa Compiler - Completed Code
-//
+// Assignment 3: Update code with Cobra
 // This compiler translates Boa programs into x86-64 assembly.
 //
 // Boa extends Adder with:
@@ -21,6 +21,9 @@ use std::io::prelude::*;
 enum Op1 {
     Add1,
     Sub1,
+    Negate,
+    IsNum,
+    IsBool,
 }
 
 /// Binary operators
@@ -29,24 +32,46 @@ enum Op2 {
     Plus,
     Minus,
     Times,
+    Less,
+    Greater,
+    LessEq,
+    GreaterEq,
+    Equal,
 }
 
-/// The Boa expression AST
+/// The Cobra expression AST
 ///
 /// Grammar:
 ///   <expr> := <number>
+///           | true | false
+///           | input
 ///           | <identifier>
 ///           | (let (<binding>+) <expr>)
-///           | (add1 <expr>) | (sub1 <expr>)
+///           | (add1 <expr>) | (sub1 <expr>) | (negate <expr>)
 ///           | (+ <expr> <expr>) | (- <expr> <expr>) | (* <expr> <expr>)
+///           | (< <expr> <expr>) | (> <expr> <expr>)
+///           | (<= <expr> <expr>) | (>= <expr> <expr>) | (= <expr> <expr>)
+///           | (isnum <expr>) | (isbool <expr>)
+///           | (if <expr> <expr> <expr>)
+///           | (block <expr>+)
+///           | (loop <expr>)
+///           | (break <expr>)
+///           | (set! <identifier> <expr>)
 ///   <binding> := (<identifier> <expr>)
 #[derive(Debug)]
 enum Expr {
     Number(i32),
+    Bool(bool),
+    Input,
     Id(String),
     Let(Vec<(String, Expr)>, Box<Expr>),
     UnOp(Op1, Box<Expr>),
     BinOp(Op2, Box<Expr>, Box<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Block(Vec<Expr>),
+    Loop(Box<Expr>),
+    Break(Box<Expr>),
+    Set(String, Box<Expr>),
 }
 
 // ============= Assembly Representation =============
@@ -63,7 +88,9 @@ enum Val {
 #[derive(Debug)]
 enum Reg {
     RAX,
+    RBX,
     RSP,
+    RDI,
 }
 
 /// Assembly instructions we generate
@@ -73,6 +100,16 @@ enum Instr {
     IAdd(Val, Val),
     ISub(Val, Val),
     IMul(Val, Val),
+    ICmp(Val, Val),
+    IJe(String),
+    IJmp(String),
+    IAnd(Val, Val),
+    IJne(String),
+    IJg(String),
+    IJge(String),
+    IJl(String),
+    IJle(String),
+    ILabel(String),
 }
 
 // ============= Parsing Helpers =============
@@ -80,11 +117,27 @@ enum Instr {
 /// Returns true if the given name is a reserved word
 ///
 /// Reserved words:
-///   let, add1, sub1
+///   let, add1, sub1, negate, isnum, isbool,
+///   true, false, input, if, block, loop, break, set!
 fn is_reserved(name: &str) -> bool {
-    name == "let" || name == "add1" || name == "sub1"
+    matches!(
+        name,
+        "let"
+            | "add1"
+            | "sub1"
+            | "negate"
+            | "isnum"
+            | "isbool"
+            | "true"
+            | "false"
+            | "input"
+            | "if"
+            | "block"
+            | "loop"
+            | "break"
+            | "set!"
+    )
 }
-
 /// Returns true if the given name is a valid Boa identifier
 ///
 /// Identifier grammar:
@@ -115,33 +168,36 @@ fn is_valid_identifier(name: &str) -> bool {
 
 /// Parse an S-expression into our Expr AST
 ///
-/// Examples of valid Boa expressions:
+/// Examples of valid Cobra expressions:
 ///   42                          -> Number(42)
+///   true                        -> Bool(true)
+///   false                       -> Bool(false)
+///   input                       -> Input
 ///   x                           -> Id("x")
 ///   (add1 5)                    -> UnOp(Add1, Number(5))
+///   (isnum 5)                   -> UnOp(IsNum, Number(5))
 ///   (+ 1 2)                     -> BinOp(Plus, Number(1), Number(2))
+///   (< 1 2)                     -> BinOp(Less, Number(1), Number(2))
+///   (if true 5 10)              -> If(Bool(true), Number(5), Number(10))
+///   (block 1 2 3)               -> Block([Number(1), Number(2), Number(3)])
+///   (loop (break 5))            -> Loop(Break(Number(5)))
+///   (set! x 5)                  -> Set("x", Number(5))
 ///   (let ((x 5)) x)             -> Let([("x", Number(5))], Id("x"))
-///   (let ((x 5) (y 6)) (+ x y)) -> Let([("x", Number(5)), ("y", Number(6))], BinOp(...))
 ///
 /// Error handling:
 ///   - Invalid syntax: panic!("Invalid")
 ///   - Number out of i32 range: panic!("Invalid")
 fn parse_expr(s: &Sexp) -> Expr {
     match s {
-        // Handle number atoms
-        //
-        // Example:
-        //   42 -> Number(42)
         Sexp::Atom(I(n)) => Expr::Number(
             i32::try_from(*n).unwrap_or_else(|_| panic!("Invalid"))
         ),
 
-        // Handle identifier atoms
-        //
-        // Example:
-        //   x -> Id("x")
+        Sexp::Atom(S(name)) if name == "true" => Expr::Bool(true),
+        Sexp::Atom(S(name)) if name == "false" => Expr::Bool(false),
+        Sexp::Atom(S(name)) if name == "input" => Expr::Input,
+
         Sexp::Atom(S(name)) => {
-            // Reject reserved words and invalid identifier forms
             if is_reserved(name) || !is_valid_identifier(name) {
                 panic!("Invalid");
             }
@@ -149,72 +205,79 @@ fn parse_expr(s: &Sexp) -> Expr {
             Expr::Id(name.clone())
         }
 
-        // Handle list expressions
-        //
-        // Examples:
-        //   (add1 5)
-        //   (+ 1 2)
-        //   (let ((x 5)) x)
         Sexp::List(vec) => {
             match &vec[..] {
-                // Parse unary add1
-                //
-                // Example:
-                //   (add1 5) -> UnOp(Add1, Number(5))
                 [Sexp::Atom(S(op)), e] if op == "add1" =>
                     Expr::UnOp(Op1::Add1, Box::new(parse_expr(e))),
 
-                // Parse unary sub1
-                //
-                // Example:
-                //   (sub1 5) -> UnOp(Sub1, Number(5))
                 [Sexp::Atom(S(op)), e] if op == "sub1" =>
                     Expr::UnOp(Op1::Sub1, Box::new(parse_expr(e))),
 
-                // Parse binary plus
-                //
-                // Example:
-                //   (+ 1 2) -> BinOp(Plus, Number(1), Number(2))
+                [Sexp::Atom(S(op)), e] if op == "negate" =>
+                    Expr::UnOp(Op1::Negate, Box::new(parse_expr(e))),
+
+                [Sexp::Atom(S(op)), e] if op == "isnum" =>
+                    Expr::UnOp(Op1::IsNum, Box::new(parse_expr(e))),
+
+                [Sexp::Atom(S(op)), e] if op == "isbool" =>
+                    Expr::UnOp(Op1::IsBool, Box::new(parse_expr(e))),
+
                 [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
-                    Expr::BinOp(
-                        Op2::Plus,
-                        Box::new(parse_expr(e1)),
-                        Box::new(parse_expr(e2)),
-                    ),
+                    Expr::BinOp(Op2::Plus, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
 
-                // Parse binary minus
-                //
-                // Example:
-                //   (- 8 3) -> BinOp(Minus, Number(8), Number(3))
                 [Sexp::Atom(S(op)), e1, e2] if op == "-" =>
-                    Expr::BinOp(
-                        Op2::Minus,
-                        Box::new(parse_expr(e1)),
-                        Box::new(parse_expr(e2)),
-                    ),
+                    Expr::BinOp(Op2::Minus, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
 
-                // Parse binary multiplication
-                //
-                // Example:
-                //   (* 4 5) -> BinOp(Times, Number(4), Number(5))
                 [Sexp::Atom(S(op)), e1, e2] if op == "*" =>
-                    Expr::BinOp(
-                        Op2::Times,
-                        Box::new(parse_expr(e1)),
-                        Box::new(parse_expr(e2)),
+                    Expr::BinOp(Op2::Times, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+
+                [Sexp::Atom(S(op)), e1, e2] if op == "<" =>
+                    Expr::BinOp(Op2::Less, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+
+                [Sexp::Atom(S(op)), e1, e2] if op == ">" =>
+                    Expr::BinOp(Op2::Greater, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+
+                [Sexp::Atom(S(op)), e1, e2] if op == "<=" =>
+                    Expr::BinOp(Op2::LessEq, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+
+                [Sexp::Atom(S(op)), e1, e2] if op == ">=" =>
+                    Expr::BinOp(Op2::GreaterEq, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+
+                [Sexp::Atom(S(op)), e1, e2] if op == "=" =>
+                    Expr::BinOp(Op2::Equal, Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+
+                [Sexp::Atom(S(op)), cond, thn, els] if op == "if" =>
+                    Expr::If(
+                        Box::new(parse_expr(cond)),
+                        Box::new(parse_expr(thn)),
+                        Box::new(parse_expr(els)),
                     ),
 
-                // Parse let expressions
-                //
-                // Example:
-                //   (let ((x 5) (y 6)) (+ x y))
+                [Sexp::Atom(S(op)), exprs @ ..] if op == "block" => {
+                    if exprs.is_empty() {
+                        panic!("Invalid");
+                    }
+                    Expr::Block(exprs.iter().map(parse_expr).collect())
+                }
+
+                [Sexp::Atom(S(op)), e] if op == "loop" =>
+                    Expr::Loop(Box::new(parse_expr(e))),
+
+                [Sexp::Atom(S(op)), e] if op == "break" =>
+                    Expr::Break(Box::new(parse_expr(e))),
+
+                [Sexp::Atom(S(op)), Sexp::Atom(S(name)), e] if op == "set!" => {
+                    if is_reserved(name) || !is_valid_identifier(name) {
+                        panic!("Invalid");
+                    }
+                    Expr::Set(name.clone(), Box::new(parse_expr(e)))
+                }
+
                 [Sexp::Atom(S(op)), Sexp::List(bindings), body] if op == "let" => {
-                    // A let expression must have at least one binding
                     if bindings.is_empty() {
                         panic!("Invalid");
                     }
 
-                    // Parse each binding into a (String, Expr) pair
                     let parsed_binds = bindings.iter().map(parse_bind).collect();
 
                     Expr::Let(parsed_binds, Box::new(parse_expr(body)))
@@ -262,6 +325,14 @@ fn parse_bind(s: &Sexp) -> (String, Expr) {
 
 // ============= Compilation =============
 
+// HELPER FUNCTION
+// Generate a unique label name for control flow
+fn new_label(label_count: &mut i32, prefix: &str) -> String {
+    let current = *label_count;
+    *label_count += 1;
+    format!("{}_{}", prefix, current)
+}
+
 /// Compile an expression to a list of assembly instructions
 ///
 /// Parameters:
@@ -269,6 +340,8 @@ fn parse_bind(s: &Sexp) -> (String, Expr) {
 ///   - si: stack index - the next available stack slot (starts at 2)
 ///         Stack slots are at [rsp - 8*si], e.g., si=2 means [rsp - 16]
 ///   - env: environment mapping variable names to stack offsets
+///   - label_count: counter used to generate unique labels for control flow
+///   - break_target: label for the innermost loop exit
 ///
 /// The compiled code should leave its result in RAX.
 ///
@@ -279,10 +352,12 @@ fn parse_bind(s: &Sexp) -> (String, Expr) {
 ///   ...
 ///
 /// Examples:
-///   Number(5) -> [IMov(Reg(RAX), Imm(5))]
+///   Number(5) -> [IMov(Reg(RAX), Imm(10))]   // tagged number
+///
+///   Bool(true) -> [IMov(Reg(RAX), Imm(3))]
 ///
 ///   UnOp(Add1, Number(5)) ->
-///     [IMov(Reg(RAX), Imm(5)), IAdd(Reg(RAX), Imm(1))]
+///     [IMov(Reg(RAX), Imm(10)), IAdd(Reg(RAX), Imm(2))]
 ///
 ///   BinOp(Plus, Number(1), Number(2)) ->
 ///     1. Compile left operand (result in RAX)
@@ -290,19 +365,140 @@ fn parse_bind(s: &Sexp) -> (String, Expr) {
 ///     3. Compile right operand (result in RAX)
 ///     4. Add stack value to RAX
 ///
+///   If(cond, thn, els) ->
+///     1. Compile condition
+///     2. Compare RAX with 1 (false)
+///     3. Jump to else branch if equal
+///     4. Compile then branch
+///     5. Jump to end
+///     6. Compile else branch
+///
+///   Loop(body) ->
+///     1. Create loop start and end labels
+///     2. Compile the body with the end label as the break target
+///     3. Jump back to the loop start
+///
+///   Break(expr) ->
+///     1. Compile the break expression
+///     2. Jump to the innermost loop end label
+///
 ///   Let([(x, 5)], Id(x)) ->
 ///     1. Compile binding expression (5)
 ///     2. Store result at stack slot
 ///     3. Add x -> stack_offset to environment
 ///     4. Compile body with updated environment
-fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr> {
+fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>, label_count: &mut i32, break_target: &Option<String>) -> Vec<Instr> {
+
     match e {
+        // ASSIGNMENT 3: TASK 2: Bool - move tagged boolean into RAX
+        //
+        // Example:
+        //   true  -> mov rax, 3
+        //   false -> mov rax, 1
+        Expr::Bool(true) => {
+            vec![Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3))]
+        }
+
+        Expr::Bool(false) => {
+            vec![Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1))]
+        }
+
+        // ASSIGNMENT 3: TASK 3: If - evaluate condition and branch accordingly
+        //
+        // Strategy:
+        //   1. Compile condition
+        //   2. Compare RAX with 1 (false)
+        //   3. Jump to else if condition is false
+        //   4. Compile then branch
+        //   5. Jump to end
+        //   6. Compile else branch
+        Expr::If(cond, thn, els) => {
+            let else_label = new_label(label_count, "if_else");
+            let end_label = new_label(label_count, "if_end");
+
+            let mut instrs = compile_to_instrs(cond, si, env, label_count, break_target);
+
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RAX), Val::Imm(1)));
+            instrs.push(Instr::IJe(else_label.clone()));
+
+            instrs.extend(compile_to_instrs(thn, si, env, label_count, break_target));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(else_label));
+            instrs.extend(compile_to_instrs(els, si, env, label_count, break_target));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+        // ASSIGNMENT 3: TASK 5: Loop - repeatedly evaluate the body until a break exits the loop
+        //
+        // Strategy:
+        //   1. Create loop start and end labels
+        //   2. Compile the body with the loop end as the break target
+        //   3. Jump back to the loop start
+        Expr::Loop(body) => {
+            let start_label = new_label(label_count, "loop_start");
+            let end_label = new_label(label_count, "loop_end");
+
+            let mut instrs = vec![Instr::ILabel(start_label.clone())];
+
+            let new_break_target = Some(end_label.clone());
+            instrs.extend(compile_to_instrs(body, si, env, label_count, &new_break_target));
+
+            instrs.push(Instr::IJmp(start_label));
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+        Expr::Input => {
+            vec![Instr::IMov(Val::Reg(Reg::RAX), Val::Reg(Reg::RDI))]
+        }
+        
+        Expr::Block(exprs) => {
+            let mut instrs = Vec::new();
+            for expr in exprs {
+                instrs.extend(compile_to_instrs(expr, si, env, label_count, break_target));
+            }
+            instrs
+        }
+        
+        Expr::Set(name, expr) => {
+            let offset = *env
+                .get(name)
+                .unwrap_or_else(|| panic!("Unbound variable identifier {}", name));
+        
+            let mut instrs = compile_to_instrs(expr, si, env, label_count, break_target);
+            instrs.push(Instr::IMov(
+                Val::RegOffset(Reg::RSP, offset),
+                Val::Reg(Reg::RAX),
+            ));
+            instrs
+        }
+
+        // Break - exit the innermost loop with the given value
+        //
+        // Example:
+        //   (break 5)
+        Expr::Break(expr) => {
+            match break_target {
+                Some(label) => {
+                    let mut instrs = compile_to_instrs(expr, si, env, label_count, break_target);
+                    instrs.push(Instr::IJmp(label.clone()));
+                    instrs
+                }
+                None => panic!("break outside loop"),
+            }
+        }
+        
         // Number - move immediate value to RAX
         //
         // Example:
         //   5 -> mov rax, 5
         Expr::Number(n) => {
-            vec![Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(*n))]
+            vec![Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(*n << 1))]
         }
 
         // Id - look up variable in environment and load from stack
@@ -323,28 +519,80 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
         }
 
         // UnOp - compile the subexpression, then apply the unary operation
-        //
+        
         // Example:
-        //   (add1 5)
-        Expr::UnOp(Op1::Add1, subexpr) => {
-            // Compile the subexpression so its result is in RAX
-            let mut instrs = compile_to_instrs(subexpr, si, env);
+        //   (negate 5)
+        // Example:
+        //   (negate 5)
+        Expr::UnOp(Op1::Negate, subexpr) => {
+            let mut instrs = compile_to_instrs(subexpr, si, env, label_count, break_target);
 
-            // Add 1 to the result in RAX
-            instrs.push(Instr::IAdd(Val::Reg(Reg::RAX), Val::Imm(1)));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::ISub(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Reg(Reg::RBX)));
 
             instrs
         }
 
         // Example:
+        //   (isnum 5)
+        Expr::UnOp(Op1::IsNum, subexpr) => {
+            let mut instrs = compile_to_instrs(subexpr, si, env, label_count, break_target);
+            let false_label = new_label(label_count, "isnum_false");
+            let end_label = new_label(label_count, "isnum_end");
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+        // Example:
+        //   (isbool true)
+        Expr::UnOp(Op1::IsBool, subexpr) => {
+            let mut instrs = compile_to_instrs(subexpr, si, env, label_count, break_target);
+            let false_label = new_label(label_count, "isbool_false");
+            let end_label = new_label(label_count, "isbool_end");
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::IJne(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+        // Example:
+        //   (add1 5)
+        Expr::UnOp(Op1::Add1, subexpr) => {
+            let mut instrs = compile_to_instrs(subexpr, si, env, label_count, break_target);
+            instrs.push(Instr::IAdd(Val::Reg(Reg::RAX), Val::Imm(2)));
+            instrs
+        }
+        
+        // Example:
         //   (sub1 5)
         Expr::UnOp(Op1::Sub1, subexpr) => {
-            // Compile the subexpression so its result is in RAX
-            let mut instrs = compile_to_instrs(subexpr, si, env);
-
-            // Subtract 1 from the result in RAX
-            instrs.push(Instr::ISub(Val::Reg(Reg::RAX), Val::Imm(1)));
-
+            let mut instrs = compile_to_instrs(subexpr, si, env, label_count, break_target);
+            instrs.push(Instr::ISub(Val::Reg(Reg::RAX), Val::Imm(2)));
             instrs
         }
 
@@ -356,30 +604,254 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
         //   3. Compile right operand
         //   4. Add saved left operand to RAX
         //
+
+        // Example:
+        //   (< 3 5)
+        Expr::BinOp(Op2::Less, left, right) => {
+            let left_offset = -8 * si;
+            let false_label = new_label(label_count, "less_false");
+            let end_label = new_label(label_count, "less_end");
+
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::IMov(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::ICmp(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+            instrs.push(Instr::IJge(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+        // Example:
+        //   (> 5 3)
+        Expr::BinOp(Op2::Greater, left, right) => {
+            let left_offset = -8 * si;
+            let false_label = new_label(label_count, "greater_false");
+            let end_label = new_label(label_count, "greater_end");
+
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::IMov(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::ICmp(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+            instrs.push(Instr::IJle(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+                // Example:
+        //   (>= 5 5)
+        Expr::BinOp(Op2::GreaterEq, left, right) => {
+            let left_offset = -8 * si;
+            let false_label = new_label(label_count, "greatereq_false");
+            let end_label = new_label(label_count, "greatereq_end");
+
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::IMov(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::ICmp(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+            instrs.push(Instr::IJl(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+        // Example:
+        //   (<= 3 3)
+        Expr::BinOp(Op2::LessEq, left, right) => {
+            let left_offset = -8 * si;
+            let false_label = new_label(label_count, "lesseq_false");
+            let end_label = new_label(label_count, "lesseq_end");
+
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::IMov(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::ICmp(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+            instrs.push(Instr::IJg(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
+                // Example:
+        //   (= 4 4)
+        Expr::BinOp(Op2::Equal, left, right) => {
+            let left_offset = -8 * si;
+            let false_label = new_label(label_count, "equal_false");
+            let end_label = new_label(label_count, "equal_end");
+
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+
+            instrs.push(Instr::IMov(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+
+            // Check that both operands have the same tag
+            instrs.push(Instr::IMov(
+                Val::Reg(Reg::RBX),
+                Val::RegOffset(Reg::RSP, left_offset),
+            ));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RDI), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RDI), Val::Imm(1)));
+
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Reg(Reg::RDI)));
+            instrs.push(Instr::IJne("error".to_string()));
+
+            instrs.push(Instr::ICmp(
+                Val::RegOffset(Reg::RSP, left_offset),
+                Val::Reg(Reg::RAX),
+            ));
+            instrs.push(Instr::IJne(false_label.clone()));
+
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(3)));
+            instrs.push(Instr::IJmp(end_label.clone()));
+
+            instrs.push(Instr::ILabel(false_label));
+            instrs.push(Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(1)));
+
+            instrs.push(Instr::ILabel(end_label));
+
+            instrs
+        }
+
         // Example:
         //   (+ 4 5)
         Expr::BinOp(Op2::Plus, left, right) => {
-            // Compute the stack offset for storing the left operand temporarily
             let stack_offset = -8 * si;
-
-            // Compile the left operand so its result is in RAX
-            let mut instrs = compile_to_instrs(left, si, env);
-
-            // Save the left operand on the stack
+        
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+        
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+        
             instrs.push(Instr::IMov(
                 Val::RegOffset(Reg::RSP, stack_offset),
                 Val::Reg(Reg::RAX),
             ));
-
-            // Compile the right operand with the next available stack slot
-            instrs.extend(compile_to_instrs(right, si + 1, env));
-
-            // Add the saved left operand to the right operand currently in RAX
+        
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+        
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+        
             instrs.push(Instr::IAdd(
                 Val::Reg(Reg::RAX),
                 Val::RegOffset(Reg::RSP, stack_offset),
             ));
-
+        
             instrs
         }
 
@@ -399,8 +871,14 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
             let right_offset = -8 * (si + 1);
 
             // Compile the left operand so its result is in RAX
-            let mut instrs = compile_to_instrs(left, si, env);
-
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+            
+            // Check that the left operand is a number
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+            
             // Save the left operand on the stack
             instrs.push(Instr::IMov(
                 Val::RegOffset(Reg::RSP, left_offset),
@@ -408,8 +886,14 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
             ));
 
             // Compile the right operand with the next available stack slot
-            instrs.extend(compile_to_instrs(right, si + 1, env));
-
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
+            
+            // Check that the right operand is a number
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+           
             // Save the right operand before overwriting RAX
             instrs.push(Instr::IMov(
                 Val::RegOffset(Reg::RSP, right_offset),
@@ -444,8 +928,14 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
             let stack_offset = -8 * si;
 
             // Compile the left operand so its result is in RAX
-            let mut instrs = compile_to_instrs(left, si, env);
-
+            let mut instrs = compile_to_instrs(left, si, env, label_count, break_target);
+            
+            // Check that the left operand is a number
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+           
             // Save the left operand on the stack
             instrs.push(Instr::IMov(
                 Val::RegOffset(Reg::RSP, stack_offset),
@@ -453,8 +943,14 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
             ));
 
             // Compile the right operand with the next available stack slot
-            instrs.extend(compile_to_instrs(right, si + 1, env));
+            instrs.extend(compile_to_instrs(right, si + 1, env, label_count, break_target));
 
+            // Check that the right operand is a number
+            instrs.push(Instr::IMov(Val::Reg(Reg::RBX), Val::Reg(Reg::RAX)));
+            instrs.push(Instr::IAnd(Val::Reg(Reg::RBX), Val::Imm(1)));
+            instrs.push(Instr::ICmp(Val::Reg(Reg::RBX), Val::Imm(0)));
+            instrs.push(Instr::IJne("error".to_string()));
+          
             // Multiply the right operand in RAX by the saved left operand
             instrs.push(Instr::IMul(
                 Val::Reg(Reg::RAX),
@@ -498,8 +994,7 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
                 seen.push(name.clone());
 
                 // Compile the binding expression using the current environment
-                instrs.extend(compile_to_instrs(expr, curr_si, &new_env));
-
+                instrs.extend(compile_to_instrs(expr, curr_si, &new_env, label_count, break_target));
                 // Compute the stack offset for this binding
                 let offset = -8 * curr_si;
 
@@ -517,8 +1012,7 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
             }
 
             // Compile the body using the fully extended environment
-            instrs.extend(compile_to_instrs(body, curr_si, &new_env));
-
+            instrs.extend(compile_to_instrs(body, curr_si, &new_env, label_count, break_target));
             instrs
         }
     }
@@ -530,7 +1024,9 @@ fn compile_to_instrs(e: &Expr, si: i32, env: &HashMap<String, i32>) -> Vec<Instr
 fn val_to_str(v: &Val) -> String {
     match v {
         Val::Reg(Reg::RAX) => String::from("rax"),
+        Val::Reg(Reg::RBX) => String::from("rbx"),
         Val::Reg(Reg::RSP) => String::from("rsp"),
+        Val::Reg(Reg::RDI) => String::from("rdi"),
         Val::Imm(n) => format!("{}", n),
 
         Val::RegOffset(Reg::RSP, offset) if *offset < 0 => {
@@ -546,6 +1042,18 @@ fn val_to_str(v: &Val) -> String {
         Val::RegOffset(Reg::RAX, offset) => {
             format!("[rax + {}]", offset)
         }
+        Val::RegOffset(Reg::RBX, offset) if *offset < 0 => {
+            format!("[rbx - {}]", -offset)
+        }
+        Val::RegOffset(Reg::RBX, offset) => {
+            format!("[rbx + {}]", offset)
+        }
+        Val::RegOffset(Reg::RDI, offset) if *offset < 0 => {
+            format!("[rdi - {}]", -offset)
+        }
+        Val::RegOffset(Reg::RDI, offset) => {
+            format!("[rdi + {}]", offset)
+        }
     }
 }
 
@@ -556,16 +1064,28 @@ fn instr_to_str(i: &Instr) -> String {
         Instr::IAdd(dst, src) => format!("add {}, {}", val_to_str(dst), val_to_str(src)),
         Instr::ISub(dst, src) => format!("sub {}, {}", val_to_str(dst), val_to_str(src)),
         Instr::IMul(dst, src) => format!("imul {}, {}", val_to_str(dst), val_to_str(src)),
-    }
+        Instr::ICmp(left, right) => format!("cmp {}, {}", val_to_str(left), val_to_str(right)),
+        Instr::IJe(label) => format!("je {}", label),
+        Instr::IJmp(label) => format!("jmp {}", label),
+        Instr::IAnd(dst, src) => format!("and {}, {}", val_to_str(dst), val_to_str(src)),
+        Instr::IJne(label) => format!("jne {}", label),
+        Instr::IJg(label) => format!("jg {}", label),
+        Instr::IJge(label) => format!("jge {}", label),
+        Instr::IJl(label) => format!("jl {}", label),
+        Instr::IJle(label) => format!("jle {}", label),
+        Instr::ILabel(label) => format!("{}:", label),
+    }   
 }
 
 /// Compile an expression to a complete assembly string
 fn compile(e: &Expr) -> String {
     // Start with an empty environment
     let env: HashMap<String, i32> = HashMap::new();
+    let mut label_count = 0;
+    let break_target = None;
 
     // Compile starting at stack slot 2
-    let instrs = compile_to_instrs(e, 2, &env);
+    let instrs = compile_to_instrs(e, 2, &env, &mut label_count, &break_target);
 
     instrs
         .iter()
@@ -602,14 +1122,20 @@ fn main() -> std::io::Result<()> {
     let instrs = compile(&expr);
 
     // Wrap instructions in assembly program template
+    // Wrap instructions in assembly program template
     let asm_program = format!(
         "section .text
-global our_code_starts_here
-our_code_starts_here:
-  {}
-  ret
-",
-        instrs
+    extern snek_error
+    global our_code_starts_here
+    our_code_starts_here:
+    {}
+    ret
+
+    error:
+    mov rdi, 1
+    call snek_error
+    ",
+            instrs
     );
 
     // Write output assembly file
@@ -623,7 +1149,8 @@ our_code_starts_here:
 //
 // Run with: cargo test
 //
-// These tests help verify your implementation. Uncomment and add more!
+// These tests verify parsing, compilation, and key error cases
+// for the Cobra language implementation.
 
 #[cfg(test)]
 mod tests {
@@ -634,16 +1161,15 @@ mod tests {
         parse_expr(&parse(s).unwrap())
     }
 
-    // ===== Parsing Tests =====
-
-    #[test]
-    fn test_parse_number() {
-        let expr = parse_str("42");
-        match expr {
-            Expr::Number(42) => (),
-            _ => panic!("Expected Number(42), got {:?}", expr),
-        }
+    // Helper to compile an expression with a fresh environment
+    fn compile_expr_for_test(expr: &Expr) -> Vec<Instr> {
+        let env: HashMap<String, i32> = HashMap::new();
+        let mut label_count = 0;
+        let break_target = None;
+        compile_to_instrs(expr, 2, &env, &mut label_count, &break_target)
     }
+
+    // ===== Parsing Tests =====
 
     #[test]
     fn test_parse_identifier() {
@@ -695,6 +1221,153 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_parse_true() {
+        let expr = parse_str("true");
+        match expr {
+            Expr::Bool(true) => (),
+            _ => panic!("Expected Bool(true), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_false() {
+        let expr = parse_str("false");
+        match expr {
+            Expr::Bool(false) => (),
+            _ => panic!("Expected Bool(false), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_input() {
+        let expr = parse_str("input");
+        match expr {
+            Expr::Input => (),
+            _ => panic!("Expected Input, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_if() {
+        let expr = parse_str("(if true 5 10)");
+        match expr {
+            Expr::If(_, _, _) => (),
+            _ => panic!("Expected If, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_if() {
+        let expr = parse_str("(if true (if false 1 2) 3)");
+        match expr {
+            Expr::If(_, then_expr, _) => match *then_expr {
+                Expr::If(_, _, _) => (),
+                _ => panic!("Expected nested If in then branch, got {:?}", then_expr),
+            },
+            _ => panic!("Expected If, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_block() {
+        let expr = parse_str("(block 1 2 3)");
+        match expr {
+            Expr::Block(exprs) => assert_eq!(exprs.len(), 3),
+            _ => panic!("Expected Block, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_loop() {
+        let expr = parse_str("(loop (break 5))");
+        match expr {
+            Expr::Loop(_) => (),
+            _ => panic!("Expected Loop, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_break() {
+        let expr = parse_str("(break 5)");
+        match expr {
+            Expr::Break(_) => (),
+            _ => panic!("Expected Break, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_set() {
+        let expr = parse_str("(set! x 5)");
+        match expr {
+            Expr::Set(name, _) => assert_eq!(name, "x"),
+            _ => panic!("Expected Set, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_isnum() {
+        let expr = parse_str("(isnum 5)");
+        match expr {
+            Expr::UnOp(Op1::IsNum, _) => (),
+            _ => panic!("Expected UnOp(IsNum, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_isbool() {
+        let expr = parse_str("(isbool true)");
+        match expr {
+            Expr::UnOp(Op1::IsBool, _) => (),
+            _ => panic!("Expected UnOp(IsBool, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_less() {
+        let expr = parse_str("(< 1 2)");
+        match expr {
+            Expr::BinOp(Op2::Less, _, _) => (),
+            _ => panic!("Expected BinOp(Less, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_greater() {
+        let expr = parse_str("(> 3 2)");
+        match expr {
+            Expr::BinOp(Op2::Greater, _, _) => (),
+            _ => panic!("Expected BinOp(Greater, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_lesseq() {
+        let expr = parse_str("(<= 3 3)");
+        match expr {
+            Expr::BinOp(Op2::LessEq, _, _) => (),
+            _ => panic!("Expected BinOp(LessEq, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_greatereq() {
+        let expr = parse_str("(>= 4 3)");
+        match expr {
+            Expr::BinOp(Op2::GreaterEq, _, _) => (),
+            _ => panic!("Expected BinOp(GreaterEq, ...), got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_equal() {
+        let expr = parse_str("(= 4 4)");
+        match expr {
+            Expr::BinOp(Op2::Equal, _, _) => (),
+            _ => panic!("Expected BinOp(Equal, ...), got {:?}", expr),
+        }
+    }
+
     // ===== Error Tests =====
 
     #[test]
@@ -702,7 +1375,9 @@ mod tests {
     fn test_duplicate_binding() {
         let expr = parse_str("(let ((x 1) (x 2)) x)");
         let env: HashMap<String, i32> = HashMap::new();
-        compile_to_instrs(&expr, 2, &env);
+        let mut label_count = 0;
+        let break_target = None;
+        compile_to_instrs(&expr, 2, &env, &mut label_count, &break_target);
     }
 
     #[test]
@@ -710,7 +1385,9 @@ mod tests {
     fn test_unbound_variable() {
         let expr = parse_str("y");
         let env: HashMap<String, i32> = HashMap::new();
-        compile_to_instrs(&expr, 2, &env);
+        let mut label_count = 0;
+        let break_target = None;
+        compile_to_instrs(&expr, 2, &env, &mut label_count, &break_target);
     }
 
     #[test]
@@ -725,13 +1402,128 @@ mod tests {
         parse_str("(let ((add1 5)) add1)");
     }
 
+    #[test]
+    #[should_panic(expected = "break outside loop")]
+    fn test_break_outside_loop() {
+        let expr = parse_str("(break 5)");
+        let env: HashMap<String, i32> = HashMap::new();
+        let mut label_count = 0;
+        let break_target = None;
+        compile_to_instrs(&expr, 2, &env, &mut label_count, &break_target);
+    }
+
     // ===== Compilation Tests =====
 
     #[test]
     fn test_compile_number() {
         let expr = Expr::Number(42);
-        let env: HashMap<String, i32> = HashMap::new();
-        let instrs = compile_to_instrs(&expr, 2, &env);
+        let instrs = compile_expr_for_test(&expr);
         assert_eq!(instrs.len(), 1);
+
+        match &instrs[0] {
+            Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(n)) => assert_eq!(*n, 84),
+            other => panic!("Expected tagged number move into RAX, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compile_true() {
+        let expr = Expr::Bool(true);
+        let instrs = compile_expr_for_test(&expr);
+        assert_eq!(instrs.len(), 1);
+
+        match &instrs[0] {
+            Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(n)) => assert_eq!(*n, 3),
+            other => panic!("Expected true to compile to 3, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compile_false() {
+        let expr = Expr::Bool(false);
+        let instrs = compile_expr_for_test(&expr);
+        assert_eq!(instrs.len(), 1);
+
+        match &instrs[0] {
+            Instr::IMov(Val::Reg(Reg::RAX), Val::Imm(n)) => assert_eq!(*n, 1),
+            other => panic!("Expected false to compile to 1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compile_if_emits_labels_and_jump() {
+        let expr = parse_str("(if true 5 10)");
+        let instrs = compile_expr_for_test(&expr);
+
+        let has_conditional_jump = instrs.iter().any(|instr| matches!(instr, Instr::IJe(_)));
+        let has_unconditional_jump = instrs.iter().any(|instr| matches!(instr, Instr::IJmp(_)));
+        let label_count = instrs.iter().filter(|instr| matches!(instr, Instr::ILabel(_))).count();
+
+        assert!(has_conditional_jump, "Expected if to emit a conditional jump");
+        assert!(has_unconditional_jump, "Expected if to emit an unconditional jump");
+        assert!(label_count >= 2, "Expected if to emit at least two labels");
+    }
+
+    #[test]
+    fn test_compile_loop_emits_loop_labels() {
+        let expr = parse_str("(loop (break 5))");
+        let instrs = compile_expr_for_test(&expr);
+
+        let jump_count = instrs.iter().filter(|instr| matches!(instr, Instr::IJmp(_))).count();
+        let label_count = instrs.iter().filter(|instr| matches!(instr, Instr::ILabel(_))).count();
+
+        assert!(jump_count >= 1, "Expected loop to emit a jump");
+        assert!(label_count >= 2, "Expected loop to emit start and end labels");
+    }
+
+    #[test]
+    fn test_compile_set_emits_store_to_stack() {
+        let expr = parse_str("(let ((x 5)) (set! x 8))");
+        let instrs = compile_expr_for_test(&expr);
+
+        let store_count = instrs
+            .iter()
+            .filter(|instr| matches!(instr, Instr::IMov(Val::RegOffset(Reg::RSP, _), Val::Reg(Reg::RAX))))
+            .count();
+
+        assert!(store_count >= 2, "Expected let and set! to store into stack slots");
+    }
+
+    #[test]
+    fn test_compile_plus_emits_type_checks() {
+        let expr = parse_str("(+ true 5)");
+        let instrs = compile_expr_for_test(&expr);
+
+        let has_and = instrs.iter().any(|instr| matches!(instr, Instr::IAnd(_, _)));
+        let has_error_jump = instrs.iter().any(|instr| {
+            matches!(instr, Instr::IJne(label) if label == "error")
+        });
+
+        assert!(has_and, "Expected arithmetic compilation to emit tag checks");
+        assert!(has_error_jump, "Expected arithmetic compilation to jump to error on bad types");
+    }
+
+    #[test]
+    fn test_compile_equal_emits_type_check() {
+        let expr = parse_str("(= true 5)");
+        let instrs = compile_expr_for_test(&expr);
+
+        let has_error_jump = instrs.iter().any(|instr| {
+            matches!(instr, Instr::IJne(label) if label == "error")
+        });
+
+        assert!(has_error_jump, "Expected equality compilation to reject mismatched tags");
+    }
+
+    #[test]
+    fn test_compile_mixed_numeric_boolean_operation_has_error_path() {
+        let expr = parse_str("(< true 5)");
+        let instrs = compile_expr_for_test(&expr);
+
+        let has_error_jump = instrs.iter().any(|instr| {
+            matches!(instr, Instr::IJne(label) if label == "error")
+        });
+
+        assert!(has_error_jump, "Expected mixed boolean/number comparison to emit an error jump");
     }
 }
